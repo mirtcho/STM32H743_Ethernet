@@ -55,7 +55,7 @@
 #define MEM_ALIGNMENT 4
 /*----- Default Value for MEM_SIZE: 1600 ---*/
 #define MEM_SIZE 131048
-/*----- Default Value for H7 devices: 0x30044000 -----*/
+/*----- Default Value for F7/H7 devices: 0x30044000 -----*/
 #define LWIP_RAM_HEAP_POINTER 0x30020000
 /*----- Value supported for H7 devices: 1 -----*/
 #define LWIP_SUPPORT_CUSTOM_PBUF 1
@@ -72,7 +72,7 @@
 /*----- Value in opt.h for LWIP_NETIF_LINK_CALLBACK: 0 -----*/
 #define LWIP_NETIF_LINK_CALLBACK 1
 /*----- Value in opt.h for TCPIP_THREAD_STACKSIZE: 0 -----*/
-#define TCPIP_THREAD_STACKSIZE 1024
+#define TCPIP_THREAD_STACKSIZE 2048
 /*----- Value in opt.h for TCPIP_THREAD_PRIO: 1 -----*/
 #define TCPIP_THREAD_PRIO 24
 /*----- Value in opt.h for TCPIP_MBOX_SIZE: 0 -----*/
@@ -82,7 +82,7 @@
 /*----- Value in opt.h for SLIPIF_THREAD_PRIO: 1 -----*/
 #define SLIPIF_THREAD_PRIO 3
 /*----- Value in opt.h for DEFAULT_THREAD_STACKSIZE: 0 -----*/
-#define DEFAULT_THREAD_STACKSIZE 1024
+#define DEFAULT_THREAD_STACKSIZE 2048
 /*----- Value in opt.h for DEFAULT_THREAD_PRIO: 1 -----*/
 #define DEFAULT_THREAD_PRIO 3
 /*----- Value in opt.h for DEFAULT_UDP_RECVMBOX_SIZE: 0 -----*/
@@ -113,7 +113,28 @@
 #define CHECKSUM_CHECK_ICMP6 0
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
+ /* ETH_CODE: first 2 macros solve errno issue with GCC 10 and ST LwIP
+  * LWIPERF_CHECK_RX_DATA enables data check for iperf. Removing it might improve performance.
+  */
 
+ #undef LWIP_PROVIDE_ERRNO
+ #define LWIP_ERRNO_STDINCLUDE
+ #define LWIPERF_CHECK_RX_DATA 1
+
+ /* ETH_CODE: macro and prototypes for proper (hopefuly?)
+  * multithreading support
+  */
+ #define LOCK_TCPIP_CORE sys_lock_tcpip_core
+ #define UNLOCK_TCPIP_CORE sys_unlock_tcpip_core
+
+ #define LWIP_ASSERT_CORE_LOCKED sys_check_core_locking
+ #define LWIP_MARK_TCPIP_THREAD sys_mark_tcpip_thread
+
+ void sys_lock_tcpip_core(void);
+ void sys_unlock_tcpip_core(void);
+
+ void sys_check_core_locking(void);
+ void sys_mark_tcpip_thread(void);
 /* USER CODE END 1 */
 
 #ifdef __cplusplus

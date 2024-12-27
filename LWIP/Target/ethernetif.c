@@ -39,6 +39,8 @@
 /* Private define ------------------------------------------------------------*/
 /* The time to block waiting for input. */
 #define TIME_WAITING_FOR_INPUT ( portMAX_DELAY )
+/* Time to block waiting for transmissions to finish */
+#define ETHIF_TX_TIMEOUT (2000U)
 /* USER CODE BEGIN OS_THREAD_STACK_SIZE_WITH_RTOS */
 /* Stack size of the interface thread */
 #define INTERFACE_THREAD_STACK_SIZE ( 350 )
@@ -59,9 +61,9 @@
 /* Private variables ---------------------------------------------------------*/
 /*
 @Note: This interface is implemented to operate in zero-copy mode only:
-        - Rx buffers will be allocated from LwIP stack memory heap,
+        - Rx Buffers will be allocated from LwIP stack Rx memory pool,
           then passed to ETH HAL driver.
-        - Tx buffers will be allocated from LwIP stack memory heap,
+        - Tx Buffers will be allocated from LwIP stack memory heap,
           then passed to ETH HAL driver.
 
 @Notes:
@@ -118,7 +120,35 @@ ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecr
 
 #endif
 
+#if defined ( __ICCARM__ ) /*!< IAR Compiler */
+#pragma location = 0x30000100
+extern u8_t memp_memory_RX_POOL_base[];
+
+#elif defined ( __CC_ARM ) /* MDK ARM Compiler */
+__attribute__((section(".Rx_PoolSection"))) extern u8_t memp_memory_RX_POOL_base[];
+
+#elif defined ( __GNUC__ ) /* GNU */
+__attribute__((section(".Rx_PoolSection"))) extern u8_t memp_memory_RX_POOL_base[];
+#endif
+
 /* USER CODE BEGIN 2 */
+/* ETH_CODE: placement of RX_POOL
+ * Please note this was tested only for GCC compiler.
+ * Additional code needed in linkerscript for GCC.
+ *
+ * Also this buffer can be placed in D1 SRAM
+ * if there is not sufficient space in D2.
+ * This can be case of STM32H72x/H73x devices.
+ * However the 32-byte alignment should be forced.
+ * Below is example of placement into BSS section
+ *
+ * . = ALIGN(32);
+ * *(.Rx_PoolSection)
+ * . = ALIGN(4);
+ * _ebss = .;
+ *  __bss_end__ = _ebss;
+ * } >RAM_D1
+ */
 #if defined ( __ICCARM__ ) /*!< IAR Compiler */
 #pragma location = 0x30040200
 extern u8_t memp_memory_RX_POOL_base[];
@@ -292,7 +322,12 @@ static void low_level_init(struct netif *netif)
   LAN8742_RegisterBusIO(&LAN8742, &LAN8742_IOCtx);
 
   /* Initialize the LAN8742 ETH PHY */
-  LAN8742_Init(&LAN8742);
+  if(LAN8742_Init(&LAN8742) != LAN8742_STATUS_OK)
+  {
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    return;
+  }
 
   if (hal_eth_init_status == HAL_OK)
   {
@@ -409,16 +444,30 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
 
   pbuf_ref(p);
 
-  if (HAL_ETH_Transmit_IT(&heth, &TxConfig) == HAL_OK) {
-    while(osSemaphoreAcquire(TxPktSemaphore, TIME_WAITING_FOR_INPUT)!=osOK)
-
+  do
+  {
+    if(HAL_ETH_Transmit_IT(&heth, &TxConfig) == HAL_OK)
     {
+      errval = ERR_OK;
     }
+    else
+    {
 
-    HAL_ETH_ReleaseTxPacket(&heth);
-  } else {
-    pbuf_free(p);
-  }
+      if(HAL_ETH_GetError(&heth) & HAL_ETH_ERROR_BUSY)
+      {
+        /* Wait for descriptors to become available */
+        osSemaphoreAcquire(TxPktSemaphore, ETHIF_TX_TIMEOUT);
+        HAL_ETH_ReleaseTxPacket(&heth);
+        errval = ERR_BUF;
+      }
+      else
+      {
+        /* Other error */
+        pbuf_free(p);
+        errval =  ERR_IF;
+      }
+    }
+  }while(errval == ERR_BUF);
 
   return errval;
 }
@@ -786,7 +835,14 @@ void ethernet_link_thread(void* argument)
 
   struct netif *netif = (struct netif *) argument;
 /* USER CODE BEGIN ETH link init */
-
+  /* ETH_CODE: call HAL_ETH_Start_IT instead of HAL_ETH_Start
+   * This is required for operation with RTOS.
+   * This trick allows to keep this change through
+   * code re-generation by STM32CubeMX
+   */
+#define HAL_ETH_Start HAL_ETH_Start_IT
+  /* ETH_CODE: workaround to call LOCK_TCPIP_CORE when accessing netif link functions*/
+  LOCK_TCPIP_CORE();
 /* USER CODE END ETH link init */
 
   for(;;)
@@ -841,6 +897,11 @@ void ethernet_link_thread(void* argument)
   }
 
 /* USER CODE BEGIN ETH link Thread core code for User BSP */
+  /* ETH_CODE: workaround to call LOCK_TCPIP_CORE when accessing netif link functions*/
+  UNLOCK_TCPIP_CORE();
+  osDelay(100);
+  LOCK_TCPIP_CORE();
+  continue; /* skip next osDelay */
 
 /* USER CODE END ETH link Thread core code for User BSP */
 
@@ -920,6 +981,44 @@ void HAL_ETH_TxFreeCallback(uint32_t * buff)
 }
 
 /* USER CODE BEGIN 8 */
+/* ETH_CODE: add functions needed for proper multithreading support and check */
 
+static osThreadId_t lwip_core_lock_holder_thread_id;
+static osThreadId_t lwip_tcpip_thread_id;
+
+void sys_lock_tcpip_core(void){
+	sys_mutex_lock(&lock_tcpip_core);
+	lwip_core_lock_holder_thread_id = osThreadGetId();
+}
+
+void sys_unlock_tcpip_core(void){
+	lwip_core_lock_holder_thread_id = 0;
+	sys_mutex_unlock(&lock_tcpip_core);
+}
+
+void sys_check_core_locking(void){
+  /* Embedded systems should check we are NOT in an interrupt context here */
+
+  LWIP_ASSERT("Function called from interrupt context", (SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) == 0);
+
+  if (lwip_tcpip_thread_id != 0) {
+	  osThreadId_t current_thread_id = osThreadGetId();
+
+#if LWIP_TCPIP_CORE_LOCKING
+	LWIP_ASSERT("Function called without core lock", current_thread_id == lwip_core_lock_holder_thread_id);
+	/* ETH_CODE: to easily check that example has correct handling of core lock
+	 * This will trigger breakpoint (__BKPT)
+	 */
+#warning Below check should be removed in production code
+	if(current_thread_id != lwip_core_lock_holder_thread_id) __BKPT(0);
+#else /* LWIP_TCPIP_CORE_LOCKING */
+	LWIP_ASSERT("Function called from wrong thread", current_thread_id == lwip_tcpip_thread_id);
+#endif /* LWIP_TCPIP_CORE_LOCKING */
+	LWIP_UNUSED_ARG(current_thread_id); /* for LWIP_NOASSERT */
+  }
+}
+void sys_mark_tcpip_thread(void){
+	lwip_tcpip_thread_id = osThreadGetId();
+}
 /* USER CODE END 8 */
 
